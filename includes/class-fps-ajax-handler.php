@@ -50,6 +50,7 @@ class FPS_Ajax_Handler {
         add_action('wp_ajax_fps_refresh_pages', array($this, 'handle_refresh_pages'));
         add_action('wp_ajax_fps_get_post_preview', array($this, 'handle_get_post_preview'));
         add_action('wp_ajax_fps_get_insights', array($this, 'handle_get_insights'));
+        add_action('wp_ajax_fps_diagnose_pages', array($this, 'handle_diagnose_pages'));
     }
     
     /**
@@ -336,6 +337,32 @@ class FPS_Ajax_Handler {
             wp_send_json_success(array('insights' => $insights));
         } else {
             wp_send_json_error(array('message' => __('Failed to get insights', 'facebook-post-scheduler')));
+        }
+    }
+    
+    /**
+     * Handle diagnose pages AJAX request
+     */
+    public function handle_diagnose_pages() {
+        // Verify nonce
+        if (!wp_verify_nonce($_POST['nonce'], 'fps_admin_nonce')) {
+            wp_send_json_error(array('message' => __('Security check failed', 'facebook-post-scheduler')));
+        }
+        
+        // Check permissions
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Insufficient permissions', 'facebook-post-scheduler')));
+        }
+        
+        $user_id = get_current_user_id();
+        
+        // Run diagnostics
+        $diagnostics = $this->facebook_api->diagnose_pages_issue($user_id);
+        
+        if ($diagnostics['success']) {
+            wp_send_json_success($diagnostics);
+        } else {
+            wp_send_json_error($diagnostics);
         }
     }
     

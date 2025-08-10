@@ -92,6 +92,11 @@ if (!defined('ABSPATH')) {
                                     <?php _e('Refresh Pages', 'facebook-post-scheduler'); ?>
                                 </button>
                                 
+                                <button type="button" id="fps-diagnose-pages" class="button">
+                                    <span class="dashicons dashicons-search"></span>
+                                    <?php _e('Diagnose Pages Issue', 'facebook-post-scheduler'); ?>
+                                </button>
+                                
                                 <button type="button" id="fps-disconnect" class="button button-secondary">
                                     <span class="dashicons dashicons-dismiss"></span>
                                     <?php _e('Disconnect', 'facebook-post-scheduler'); ?>

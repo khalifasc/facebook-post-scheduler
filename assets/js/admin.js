@@ -55,6 +55,9 @@
       // Refresh pages
       $('#fps-refresh-pages').on('click', this.refreshPages);
       
+      // Diagnose pages
+      $('#fps-diagnose-pages').on('click', this.diagnosePages);
+      
       // Post management
       $('.fps-edit-post').on('click', this.editPost);
       $('.fps-delete-post').on('click', this.deletePost);
@@ -468,6 +471,69 @@
           if (response.success) {
             alert(response.data.message);
             location.reload();
+          } else {
+            alert(fpsAdmin.strings.error + ': ' + response.data.message);
+          }
+        },
+        error: function() {
+          alert(fpsAdmin.strings.error);
+        },
+        complete: function() {
+          button.prop('disabled', false).html(originalText);
+        }
+      });
+    },
+    
+    /**
+     * Diagnose pages issues
+     */
+    diagnosePages: function(e) {
+      e.preventDefault();
+      
+      const button = $(this);
+      const originalText = button.html();
+      
+      button.prop('disabled', true).html('<span class="fps-spinner"></span> Diagnosing...');
+      
+      $.ajax({
+        url: fpsAdmin.ajaxUrl,
+        type: 'POST',
+        data: {
+          action: 'fps_diagnose_pages',
+          nonce: fpsAdmin.nonce
+        },
+        success: function(response) {
+          if (response.success) {
+            let message = 'Diagnostic Results:\n\n';
+            
+            if (response.data.user_info) {
+              message += 'User: ' + response.data.user_info.name + ' (ID: ' + response.data.user_info.id + ')\n';
+            }
+            
+            if (response.data.permissions) {
+              message += 'Permissions: ';
+              const grantedPerms = response.data.permissions.filter(p => p.status === 'granted').map(p => p.permission);
+              message += grantedPerms.join(', ') + '\n';
+            }
+            
+            message += 'Raw pages found: ' + response.data.raw_pages_count + '\n\n';
+            
+            if (response.data.raw_pages && response.data.raw_pages.data) {
+              message += 'Pages details:\n';
+              response.data.raw_pages.data.forEach(function(page, index) {
+                message += (index + 1) + '. ' + page.name + ' (ID: ' + page.id + ')\n';
+                if (page.tasks) {
+                  message += '   Tasks: ' + page.tasks.join(', ') + '\n';
+                }
+                if (page.access_token) {
+                  message += '   Has access token: Yes\n';
+                } else {
+                  message += '   Has access token: No\n';
+                }
+              });
+            }
+            
+            alert(message);
           } else {
             alert(fpsAdmin.strings.error + ': ' + response.data.message);
           }

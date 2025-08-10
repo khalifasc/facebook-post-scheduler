@@ -49,7 +49,9 @@ class FPS_Facebook_API {
         $default_permissions = array(
             'pages_manage_posts',
             'pages_read_engagement',
-            'pages_show_list'
+            'pages_show_list',
+            'pages_manage_metadata',
+            'business_management'
         );
         
         $permissions = array_merge($default_permissions, $permissions);
@@ -59,7 +61,8 @@ class FPS_Facebook_API {
             'redirect_uri' => $redirect_uri,
             'scope' => implode(',', $permissions),
             'response_type' => 'code',
-            'state' => wp_create_nonce('fps_facebook_oauth')
+            'state' => wp_create_nonce('fps_facebook_oauth'),
+            'auth_type' => 'rerequest'
         );
         
         return 'https://www.facebook.com/v18.0/dialog/oauth?' . http_build_query($params);
@@ -129,13 +132,236 @@ class FPS_Facebook_API {
         $token_data = $this->token_manager->get_user_token($user_id);
         
         if (!$token_data) {
+            FPS_Logger::log('No user token found for user ' . $user_id, 'error');
             return false;
         }
         
+        // Primeiro, vamos verificar se o token é válido
+        $token_validation = $this->validate_token($token_data['access_token']);
+        if (!$token_validation) {
+            FPS_Logger::log('Invalid user token for user ' . $user_id, 'error');
+            return false;
+        }
+        
+        FPS_Logger::log('Token validation successful for user: ' . $token_validation['name'], 'info');
+        
+        // Buscar páginas com paginação
+        $all_pages = array();
+        $next_url = null;
+        $page_count = 0;
+        $max_pages = 100; // Limite de segurança
+        
+        do {
+            $pages_data = $this->fetch_pages_batch($token_data['access_token'], $next_url);
+            
+            if ($pages_data === false) {
+                FPS_Logger::log('Failed to fetch pages batch for user ' . $user_id, 'error');
+                break;
+            }
+            
+            if (isset($pages_data['data']) && is_array($pages_data['data'])) {
+                $all_pages = array_merge($all_pages, $pages_data['data']);
+                $page_count += count($pages_data['data']);
+                
+                FPS_Logger::log('Fetched ' . count($pages_data['data']) . ' pages in this batch', 'info');
+            }
+            
+            // Verificar se há próxima página
+            $next_url = isset($pages_data['paging']['next']) ? $pages_data['paging']['next'] : null;
+            
+        } while ($next_url && $page_count < $max_pages);
+        
+        FPS_Logger::log('Total pages found: ' . count($all_pages), 'info');
+        
+        // Filtrar apenas páginas onde o usuário tem permissões adequadas
+        $valid_pages = array();
+        foreach ($all_pages as $page) {
+            if ($this->validate_page_permissions($page)) {
+                $valid_pages[] = $page;
+                
+                // Armazenar token da página se disponível
+                if (isset($page['access_token'])) {
+                    $page_token_data = array(
+                        'access_token' => $page['access_token'],
+                        'page_id' => $page['id'],
+                        'page_name' => $page['name'],
+                        'created_at' => time(),
+                        'expires_at' => 0 // Page tokens don't expire
+                    );
+                    
+                    $this->token_manager->store_page_token($page['id'], $page_token_data);
+                }
+            }
+        }
+        
+        FPS_Logger::log('Valid pages after filtering: ' . count($valid_pages), 'info');
+        
+        return $valid_pages;
+    }
+    
+    /**
+     * Fetch a batch of pages from Facebook API
+     * 
+     * @param string $access_token User access token
+     * @param string|null $next_url Next page URL or null for first request
+     * @return array|false Pages data or false
+     */
+    private function fetch_pages_batch($access_token, $next_url = null) {
+        if ($next_url) {
+            $url = $next_url;
+        } else {
+            $url = $this->api_base_url . 'me/accounts';
+            $params = array(
+                'access_token' => $access_token,
+                'fields' => 'id,name,access_token,category,picture.width(100).height(100),fan_count,tasks,perms',
+                'limit' => 25
+            );
+            $url = add_query_arg($params, $url);
+        }
+        
+        FPS_Logger::log('Fetching pages from: ' . $url, 'debug');
+        
+        $response = wp_remote_get($url, array(
+            'timeout' => 30,
+            'headers' => array(
+                'User-Agent' => 'WordPress Facebook Post Scheduler v' . FPS_VERSION
+            )
+        ));
+        
+        if (is_wp_error($response)) {
+            FPS_Logger::log('HTTP error fetching pages: ' . $response->get_error_message(), 'error');
+            return false;
+        }
+        
+        $http_code = wp_remote_retrieve_response_code($response);
+        if ($http_code !== 200) {
+            FPS_Logger::log('HTTP error code: ' . $http_code, 'error');
+            return false;
+        }
+        
+        $body = wp_remote_retrieve_body($response);
+        $data = json_decode($body, true);
+        
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            FPS_Logger::log('JSON decode error: ' . json_last_error_msg(), 'error');
+            return false;
+        }
+        
+        if (isset($data['error'])) {
+            FPS_Logger::log('Facebook API error: ' . $data['error']['message'] . ' (Code: ' . $data['error']['code'] . ')', 'error');
+            
+            // Log detalhes específicos do erro
+            if (isset($data['error']['error_subcode'])) {
+                FPS_Logger::log('Error subcode: ' . $data['error']['error_subcode'], 'error');
+            }
+            
+            return false;
+        }
+        
+        return $data;
+    }
+    
+    /**
+     * Validate if user has adequate permissions on a page
+     * 
+     * @param array $page Page data from Facebook
+     * @return bool True if user has adequate permissions
+     */
+    private function validate_page_permissions($page) {
+        // Verificar se o usuário tem token de acesso para a página
+        if (!isset($page['access_token']) || empty($page['access_token'])) {
+            FPS_Logger::log('No access token for page: ' . $page['name'], 'warning');
+            return false;
+        }
+        
+        // Verificar se o usuário tem as tarefas necessárias
+        if (isset($page['tasks']) && is_array($page['tasks'])) {
+            $required_tasks = array('MANAGE', 'CREATE_CONTENT');
+            $user_tasks = $page['tasks'];
+            
+            $has_required_permissions = false;
+            foreach ($required_tasks as $required_task) {
+                if (in_array($required_task, $user_tasks)) {
+                    $has_required_permissions = true;
+                    break;
+                }
+            }
+            
+            if (!$has_required_permissions) {
+                FPS_Logger::log('Insufficient permissions for page: ' . $page['name'] . '. User tasks: ' . implode(', ', $user_tasks), 'warning');
+                return false;
+            }
+        }
+        
+        // Verificar permissões específicas se disponíveis
+        if (isset($page['perms']) && is_array($page['perms'])) {
+            $required_perms = array('CREATE_CONTENT', 'MANAGE');
+            $user_perms = $page['perms'];
+            
+            $has_required_perms = false;
+            foreach ($required_perms as $required_perm) {
+                if (in_array($required_perm, $user_perms)) {
+                    $has_required_perms = true;
+                    break;
+                }
+            }
+            
+            if (!$has_required_perms) {
+                FPS_Logger::log('Insufficient perms for page: ' . $page['name'] . '. User perms: ' . implode(', ', $user_perms), 'warning');
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    /**
+     * Get detailed information about why no pages were found
+     * 
+     * @param int $user_id User ID
+     * @return array Diagnostic information
+     */
+    public function diagnose_pages_issue($user_id) {
         $url = $this->api_base_url . 'me/accounts';
+        $token_data = $this->token_manager->get_user_token($user_id);
+        
+        if (!$token_data) {
+            return array(
+                'success' => false,
+                'message' => 'No user token found',
+                'details' => array()
+            );
+        }
+        
+        // 1. Verificar token do usuário
+        $me_data = $this->get_user_info($token_data['access_token']);
+        
+        // 2. Verificar permissões do token
+        $permissions = $this->get_token_permissions($token_data['access_token']);
+        
+        // 3. Tentar buscar páginas sem filtros
+        $raw_pages = $this->fetch_pages_batch($token_data['access_token']);
+        
+        return array(
+            'success' => true,
+            'user_info' => $me_data,
+            'permissions' => $permissions,
+            'raw_pages_count' => isset($raw_pages['data']) ? count($raw_pages['data']) : 0,
+            'raw_pages' => $raw_pages
+        );
+    }
+    
+    /**
+     * Get user information
+     * 
+     * @param string $access_token Access token
+     * @return array|false User info or false
+     */
+    private function get_user_info($access_token) {
+        $url = $this->api_base_url . 'me';
         $params = array(
-            'access_token' => $token_data['access_token'],
-            'fields' => 'id,name,access_token,category,picture,fan_count,tasks'
+            'access_token' => $access_token,
+            'fields' => 'id,name,email'
         );
         
         $response = wp_remote_get(add_query_arg($params, $url), array(
@@ -146,7 +372,6 @@ class FPS_Facebook_API {
         ));
         
         if (is_wp_error($response)) {
-            FPS_Logger::log('Failed to get user pages: ' . $response->get_error_message(), 'error');
             return false;
         }
         
@@ -154,31 +379,43 @@ class FPS_Facebook_API {
         $data = json_decode($body, true);
         
         if (isset($data['error'])) {
-            FPS_Logger::log('Get pages error: ' . $data['error']['message'], 'error');
             return false;
         }
         
-        if (!isset($data['data'])) {
-            return array();
+        return $data;
+    }
+    
+    /**
+     * Get token permissions
+     * 
+     * @param string $access_token Access token
+     * @return array|false Permissions or false
+     */
+    private function get_token_permissions($access_token) {
+        $url = $this->api_base_url . 'me/permissions';
+        $params = array(
+            'access_token' => $access_token
+        );
+        
+        $response = wp_remote_get(add_query_arg($params, $url), array(
+            'timeout' => 15,
+            'headers' => array(
+                'User-Agent' => 'WordPress Facebook Post Scheduler v' . FPS_VERSION
+            )
+        ));
+        
+        if (is_wp_error($response)) {
+            return false;
         }
         
-        // Store page tokens
-        foreach ($data['data'] as $page) {
-            if (isset($page['access_token'])) {
-                $page_token_data = array(
-                    'access_token' => $page['access_token'],
-                    'page_id' => $page['id'],
-                    'page_name' => $page['name'],
-                    'created_at' => time(),
-                    'expires_at' => 0 // Page tokens don't expire
-                );
-                
-                $this->token_manager->store_page_token($page['id'], $page_token_data);
-            }
+        $body = wp_remote_retrieve_body($response);
+        $data = json_decode($body, true);
+        
+        if (isset($data['error'])) {
+            return false;
         }
         
-        FPS_Logger::log('Retrieved ' . count($data['data']) . ' pages for user ' . $user_id, 'info');
-        return $data['data'];
+        return isset($data['data']) ? $data['data'] : array();
     }
     
     /**
